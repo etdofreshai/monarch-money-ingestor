@@ -226,6 +226,43 @@ async function refreshTokenFromBrowser(): Promise<{ refreshed: boolean; candidat
   return { refreshed: false, candidates: candidates.length };
 }
 
+async function probeBrowserGraphql(): Promise<{ ok: boolean; totalCount?: number; error?: string }> {
+  const page = await findMonarchPage();
+  if (!page?.webSocketDebuggerUrl) {
+    return { ok: false, error: 'No logged-in Monarch page found' };
+  }
+
+  const expression = `fetch('https://api.monarch.com/graphql', {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Monarch-Client': 'monarch-core-web-app-graphql',
+      'Monarch-Client-Version': 'v1.0.1772'
+    },
+    body: JSON.stringify({
+      query: 'query BrowserProbe { allTransactions { totalCount __typename } }',
+      variables: {}
+    })
+  }).then(async (r) => ({ status: r.status, text: await r.text() }))`;
+
+  try {
+    const result: any = await cdpEvaluate(page.webSocketDebuggerUrl, expression);
+    if (!result || result.status < 200 || result.status >= 300) {
+      return { ok: false, error: `HTTP ${result?.status || 'unknown'}` };
+    }
+    const parsed = JSON.parse(String(result.text || '{}'));
+    const totalCount = parsed?.data?.allTransactions?.totalCount;
+    if (typeof totalCount === 'number') {
+      return { ok: true, totalCount };
+    }
+    return { ok: false, error: parsed?.errors?.[0]?.message || 'No totalCount in response' };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 function renderBrowserPage(key: string, message = ''): string {
   const vncPassword = process.env.NOVNC_PASSWORD ? 'configured' : 'missing';
   const novncUrl = process.env.NOVNC_PUBLIC_URL || 'https://monarch-browser.etdofresh.com/vnc.html';
@@ -241,6 +278,7 @@ ${message ? `<div class="msg">${htmlEscape(message)}</div>` : ''}
   <a href="${htmlEscape(novncUrl)}" target="_blank">Open noVNC</a>
   <form method="post" action="/admin/browser/open"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Open Monarch tab</button></form>
   <form method="post" action="/admin/browser/refresh-token"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Refresh token from browser</button></form>
+  <form method="post" action="/admin/browser/probe-graphql"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Probe browser GraphQL</button></form>
 </div>
 <p class="hint">CDP stays localhost-only; this page never prints cookies or tokens.</p>
 </main></body></html>`;
@@ -451,6 +489,16 @@ export function createServer(): express.Application {
     } catch (error) {
       res.status(500).type('html').send(renderBrowserPage(key, `Browser refresh failed: ${error instanceof Error ? error.message : String(error)}`));
     }
+  });
+
+  app.post('/admin/browser/probe-graphql', async (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+    const key = String(req.body?.key || req.query.key || '');
+    const result = await probeBrowserGraphql();
+    const message = result.ok
+      ? `Browser GraphQL works. Monarch reports ${result.totalCount} transactions.`
+      : `Browser GraphQL probe failed: ${result.error}`;
+    res.status(result.ok ? 200 : 400).type('html').send(renderBrowserPage(key, message));
   });
 
   return app;
