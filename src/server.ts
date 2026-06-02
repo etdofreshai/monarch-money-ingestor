@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
 import { getStatus, clearStatusCache } from './sync.js';
+import { createApiClient, type ApiTransaction } from './api-client.js';
 import { createMonarchClient } from './monarch-client.js';
 
 function htmlEscape(value: string): string {
@@ -376,6 +377,172 @@ async function captureBrowserGraphql(): Promise<{ ok: boolean; url?: string; met
   }
 }
 
+async function browserGraphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+  const page = await findMonarchPage();
+  if (!page?.webSocketDebuggerUrl) {
+    throw new Error('No logged-in Monarch page found');
+  }
+
+  const expression = `(() => {
+    const cookie = document.cookie || '';
+    const csrf = (cookie.match(/(?:^|; )csrftoken=([^;]+)/) || [])[1] || (cookie.match(/(?:^|; )csrf=([^;]+)/) || [])[1] || '';
+    const findDeviceUuid = () => {
+      const scan = (value, depth = 0) => {
+        if (depth > 5 || value == null) return '';
+        if (typeof value === 'string') {
+          if (/^[0-9a-f-]{32,36}$/i.test(value)) return value;
+          if ((value.startsWith('{') || value.startsWith('[')) && value.length < 200000) {
+            try { return scan(JSON.parse(value), depth + 1); } catch (_) {}
+          }
+          return '';
+        }
+        if (Array.isArray(value)) {
+          for (const item of value) { const found = scan(item, depth + 1); if (found) return found; }
+          return '';
+        }
+        if (typeof value === 'object') {
+          for (const [key, nested] of Object.entries(value)) {
+            if (/device.*uuid|uuid/i.test(key) && typeof nested === 'string' && nested.length >= 16) return nested;
+            const found = scan(nested, depth + 1); if (found) return found;
+          }
+        }
+        return '';
+      };
+      for (const store of [window.localStorage, window.sessionStorage]) {
+        for (let i = 0; i < store.length; i++) {
+          const key = store.key(i);
+          if (/device.*uuid|uuid/i.test(key || '')) {
+            const direct = store.getItem(key) || '';
+            if (direct.length >= 16) return direct;
+          }
+          const found = scan(store.getItem(key) || '');
+          if (found) return found;
+        }
+      }
+      return '';
+    };
+    const headers = {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Client-Platform': 'web',
+      'Monarch-Client': 'monarch-core-web-app-graphql',
+      'Monarch-Client-Version': 'v1.0.1772'
+    };
+    if (csrf) headers['x-csrftoken'] = decodeURIComponent(csrf);
+    const deviceUuid = findDeviceUuid();
+    if (deviceUuid) headers['device-uuid'] = deviceUuid;
+    return fetch('https://api.monarch.com/graphql', {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body: JSON.stringify({ query: ${JSON.stringify(query)}, variables: ${JSON.stringify(variables)} })
+    }).then(async (r) => ({ status: r.status, text: await r.text() }));
+  })()`;
+
+  const result: any = await cdpEvaluate(page.webSocketDebuggerUrl, expression);
+  if (!result || result.status < 200 || result.status >= 300) {
+    throw new Error(`Browser GraphQL HTTP ${result?.status || 'unknown'}: ${String(result?.text || '').slice(0, 180)}`);
+  }
+  const parsed = JSON.parse(String(result.text || '{}'));
+  if (parsed.errors?.length) {
+    throw new Error(parsed.errors[0]?.message || 'Browser GraphQL returned errors');
+  }
+  return parsed.data as T;
+}
+
+function toBrowserApiTransaction(txn: any): ApiTransaction {
+  return {
+    external_id: String(txn.id),
+    source: 'monarch',
+    date: new Date(txn.date).toISOString().split('T')[0],
+    merchant: txn.merchant?.name || txn.merchantName || txn.plaidName || null,
+    category: txn.category?.name || txn.categoryName || null,
+    account_name: txn.account?.name || txn.accountName || null,
+    amount: Number(txn.amount),
+    notes: txn.notes || null,
+    tags: Array.isArray(txn.tags) ? txn.tags.map((t: any) => typeof t === 'string' ? t : String(t?.name || '')).filter(Boolean) : [],
+    metadata: txn,
+  };
+}
+
+async function runBrowserBackedSync(full = false): Promise<{ new: number; updated: number; skipped: number; fetched: number; latest_date: string | null }> {
+  const apiClient = createApiClient();
+  const syncState = await apiClient.getSyncState('monarch');
+  const lastRecordDate = syncState?.last_record_date;
+  let startDate: string | undefined;
+  if (!full && lastRecordDate) {
+    const bufferDate = new Date(lastRecordDate);
+    bufferDate.setDate(bufferDate.getDate() - 7);
+    startDate = bufferDate.toISOString().split('T')[0];
+  }
+
+  const query = `query BrowserBackedTransactions($offset: Int, $limit: Int, $filters: TransactionFilterInput, $orderBy: TransactionOrdering) {
+    allTransactions(filters: $filters) {
+      totalCount
+      results(offset: $offset, limit: $limit, orderBy: $orderBy) {
+        id amount pending date hideFromReports hiddenByAccount plaidName notes isRecurring reviewStatus needsReview reviewedAt isSplitTransaction dataProviderDescription __typename
+        category { id name __typename }
+        merchant { id name __typename }
+        account { id name __typename }
+        tags { id name __typename }
+      }
+    }
+  }`;
+
+  const limit = 200;
+  let offset = 0;
+  let fetched = 0;
+  let totalNew = 0;
+  let totalUpdated = 0;
+  let totalSkipped = 0;
+  let latestDate: Date | null = null;
+
+  while (true) {
+    const filters: Record<string, unknown> = {};
+    if (startDate) {
+      filters.startDate = startDate;
+    }
+    const data = await browserGraphql<{ allTransactions: { totalCount: number; results: any[] } }>(query, {
+      offset,
+      limit,
+      orderBy: 'date',
+      filters,
+    });
+    const transactions = data.allTransactions?.results || [];
+    if (transactions.length === 0) break;
+
+    const apiTransactions = transactions.map(toBrowserApiTransaction);
+    const result = await apiClient.batchUpsertTransactions(apiTransactions);
+    totalNew += result.results.new;
+    totalUpdated += result.results.updated;
+    totalSkipped += result.results.skipped;
+    fetched += transactions.length;
+
+    for (const txn of transactions) {
+      const d = txn.date ? new Date(txn.date) : null;
+      if (d && (!latestDate || d > latestDate)) latestDate = d;
+    }
+
+    offset += transactions.length;
+    if (transactions.length < limit) break;
+    if (offset >= data.allTransactions.totalCount) break;
+  }
+
+  const stats = await apiClient.getTransactionStats();
+  await apiClient.updateSyncState('monarch', {
+    source: 'monarch',
+    last_sync_date: new Date().toISOString(),
+    last_record_date: latestDate?.toISOString().split('T')[0] || null,
+    total_records: stats.total,
+    last_run_at: new Date().toISOString(),
+    error_message: null,
+    metadata: { mode: 'browser' },
+  });
+  clearStatusCache();
+
+  return { new: totalNew, updated: totalUpdated, skipped: totalSkipped, fetched, latest_date: latestDate?.toISOString().split('T')[0] || null };
+}
+
 function renderBrowserPage(key: string, message = ''): string {
   const vncPassword = process.env.NOVNC_PASSWORD ? 'configured' : 'missing';
   const novncUrl = process.env.NOVNC_PUBLIC_URL || 'https://monarch-browser.etdofresh.com/vnc.html';
@@ -393,6 +560,7 @@ ${message ? `<div class="msg">${htmlEscape(message)}</div>` : ''}
   <form method="post" action="/admin/browser/refresh-token"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Refresh token from browser</button></form>
   <form method="post" action="/admin/browser/probe-graphql"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Probe browser GraphQL</button></form>
   <form method="post" action="/admin/browser/capture-graphql"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Capture real GraphQL request</button></form>
+  <form method="post" action="/admin/browser/sync"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Run browser-backed sync</button></form>
 </div>
 <p class="hint">CDP stays localhost-only; this page never prints cookies or tokens.</p>
 </main></body></html>`;
@@ -629,6 +797,19 @@ export function createServer(): express.Application {
       ? `Captured Monarch GraphQL request.\nMethod: ${result.method}\nAuth header present: ${result.auth_header}\nBearer token saved: ${result.bearer_saved}\nHeaders: ${(result.header_names || []).join(', ')}`
       : `GraphQL capture failed: ${result.error}`;
     res.status(result.ok ? 200 : 400).type('html').send(renderBrowserPage(key, message));
+  });
+
+  app.post('/admin/browser/sync', async (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+    const key = String(req.body?.key || req.query.key || '');
+    const full = req.query.full === 'true' || req.body?.full === 'true';
+    try {
+      const result = await runBrowserBackedSync(full);
+      const message = `Browser-backed sync complete.\nFetched: ${result.fetched}\nNew: ${result.new}\nUpdated: ${result.updated}\nSkipped: ${result.skipped}\nLatest date: ${result.latest_date || 'none'}`;
+      res.type('html').send(renderBrowserPage(key, message));
+    } catch (error) {
+      res.status(500).type('html').send(renderBrowserPage(key, `Browser-backed sync failed: ${error instanceof Error ? error.message : String(error)}`));
+    }
   });
 
   return app;
