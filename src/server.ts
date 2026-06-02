@@ -226,7 +226,7 @@ async function refreshTokenFromBrowser(): Promise<{ refreshed: boolean; candidat
   return { refreshed: false, candidates: candidates.length };
 }
 
-async function probeBrowserGraphql(): Promise<{ ok: boolean; totalCount?: number; error?: string }> {
+async function probeBrowserGraphql(): Promise<{ ok: boolean; totalCount?: number; error?: string; status?: number; preview?: string }> {
   const page = await findMonarchPage();
   if (!page?.webSocketDebuggerUrl) {
     return { ok: false, error: 'No logged-in Monarch page found' };
@@ -238,6 +238,7 @@ async function probeBrowserGraphql(): Promise<{ ok: boolean; totalCount?: number
     headers: {
       'Accept': 'application/json',
       'Content-Type': 'application/json',
+      'Client-Platform': 'web',
       'Monarch-Client': 'monarch-core-web-app-graphql',
       'Monarch-Client-Version': 'v1.0.1772'
     },
@@ -250,14 +251,82 @@ async function probeBrowserGraphql(): Promise<{ ok: boolean; totalCount?: number
   try {
     const result: any = await cdpEvaluate(page.webSocketDebuggerUrl, expression);
     if (!result || result.status < 200 || result.status >= 300) {
-      return { ok: false, error: `HTTP ${result?.status || 'unknown'}` };
+      return { ok: false, status: result?.status, error: `HTTP ${result?.status || 'unknown'}`, preview: String(result?.text || '').slice(0, 180) };
     }
     const parsed = JSON.parse(String(result.text || '{}'));
     const totalCount = parsed?.data?.allTransactions?.totalCount;
     if (typeof totalCount === 'number') {
       return { ok: true, totalCount };
     }
-    return { ok: false, error: parsed?.errors?.[0]?.message || 'No totalCount in response' };
+    return { ok: false, error: parsed?.errors?.[0]?.message || 'No totalCount in response', preview: String(result.text || '').slice(0, 180) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function cdpCaptureGraphql(webSocketUrl: string): Promise<{ ok: boolean; url?: string; method?: string; header_names?: string[]; auth_header?: boolean; bearer_saved?: boolean; error?: string }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(webSocketUrl);
+    let settled = false;
+    let nextId = 1;
+    const send = (method: string, params: Record<string, unknown> = {}) => {
+      ws.send(JSON.stringify({ id: nextId++, method, params }));
+    };
+    const finish = (value: any) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ws.close();
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish({ ok: false, error: 'Timed out waiting for Monarch GraphQL request' }), 30000);
+
+    ws.on('open', () => {
+      send('Network.enable');
+      send('Page.enable');
+      setTimeout(() => send('Page.reload', { ignoreCache: true }), 500);
+    });
+
+    ws.on('message', (data) => {
+      const message = JSON.parse(String(data));
+      if (message.method !== 'Network.requestWillBeSent') return;
+      const req = message.params?.request;
+      const url = String(req?.url || '');
+      if (!url.includes('api.monarch.com/graphql')) return;
+      const headers = req?.headers || {};
+      const headerNames = Object.keys(headers).sort();
+      const authValue = String(headers.Authorization || headers.authorization || '');
+      let bearerSaved = false;
+      if (authValue.startsWith('Bearer ') && authValue.length > 40) {
+        saveMonarchToken(authValue.slice('Bearer '.length));
+        bearerSaved = true;
+      }
+      finish({
+        ok: true,
+        url,
+        method: req?.method,
+        header_names: headerNames,
+        auth_header: Boolean(authValue),
+        bearer_saved: bearerSaved,
+      });
+    });
+
+    ws.on('error', (error) => {
+      if (!settled) {
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+  });
+}
+
+async function captureBrowserGraphql(): Promise<{ ok: boolean; url?: string; method?: string; header_names?: string[]; auth_header?: boolean; bearer_saved?: boolean; error?: string }> {
+  const page = await findMonarchPage();
+  if (!page?.webSocketDebuggerUrl) {
+    return { ok: false, error: 'No logged-in Monarch page found' };
+  }
+  try {
+    return await cdpCaptureGraphql(page.webSocketDebuggerUrl);
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
@@ -279,6 +348,7 @@ ${message ? `<div class="msg">${htmlEscape(message)}</div>` : ''}
   <form method="post" action="/admin/browser/open"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Open Monarch tab</button></form>
   <form method="post" action="/admin/browser/refresh-token"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Refresh token from browser</button></form>
   <form method="post" action="/admin/browser/probe-graphql"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Probe browser GraphQL</button></form>
+  <form method="post" action="/admin/browser/capture-graphql"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Capture real GraphQL request</button></form>
 </div>
 <p class="hint">CDP stays localhost-only; this page never prints cookies or tokens.</p>
 </main></body></html>`;
@@ -497,7 +567,23 @@ export function createServer(): express.Application {
     const result = await probeBrowserGraphql();
     const message = result.ok
       ? `Browser GraphQL works. Monarch reports ${result.totalCount} transactions.`
-      : `Browser GraphQL probe failed: ${result.error}`;
+      : `Browser GraphQL probe failed: ${result.error}${result.preview ? `\nPreview: ${result.preview}` : ''}`;
+    res.status(result.ok ? 200 : 400).type('html').send(renderBrowserPage(key, message));
+  });
+
+  app.post('/admin/browser/capture-graphql', async (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+    const key = String(req.body?.key || req.query.key || '');
+    const result = await captureBrowserGraphql();
+    if (result.bearer_saved) {
+      const { runSync } = await import('./sync.js');
+      runSync({ full: false }).catch((error) => {
+        console.error('[admin-browser] Sync error after captured bearer refresh:', error);
+      });
+    }
+    const message = result.ok
+      ? `Captured Monarch GraphQL request.\nMethod: ${result.method}\nAuth header present: ${result.auth_header}\nBearer token saved: ${result.bearer_saved}\nHeaders: ${(result.header_names || []).join(', ')}`
+      : `GraphQL capture failed: ${result.error}`;
     res.status(result.ok ? 200 : 400).type('html').send(renderBrowserPage(key, message));
   });
 
