@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import cron from 'node-cron';
 import fs from 'fs';
 import path from 'path';
+import WebSocket from 'ws';
 import { getStatus, clearStatusCache } from './sync.js';
 import { createMonarchClient } from './monarch-client.js';
 
@@ -47,6 +48,157 @@ function saveMonarchToken(token: string): void {
   lines.push(`MONARCH_TOKEN=${token}`);
   fs.writeFileSync(envPath, `${lines.join('\n')}\n`);
   process.env.MONARCH_TOKEN = token;
+}
+
+type CdpTarget = {
+  id: string;
+  type: string;
+  title: string;
+  url: string;
+  webSocketDebuggerUrl?: string;
+};
+
+function getCdpBaseUrl(): string {
+  return (process.env.CHROME_CDP_URL || 'http://127.0.0.1:9222').replace(/\/$/, '');
+}
+
+async function fetchJson<T>(url: string): Promise<T> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+  }
+  return await response.json() as T;
+}
+
+async function getCdpTargets(): Promise<CdpTarget[]> {
+  return await fetchJson<CdpTarget[]>(`${getCdpBaseUrl()}/json/list`);
+}
+
+async function openMonarchTab(): Promise<CdpTarget> {
+  const url = process.env.BROWSER_START_URL || 'https://app.monarchmoney.com/login';
+  return await fetchJson<CdpTarget>(`${getCdpBaseUrl()}/json/new?${encodeURIComponent(url)}`);
+}
+
+function cdpEvaluate(webSocketUrl: string, expression: string): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(webSocketUrl);
+    const timer = setTimeout(() => {
+      ws.close();
+      reject(new Error('CDP evaluation timed out'));
+    }, 10000);
+
+    ws.on('open', () => {
+      ws.send(JSON.stringify({
+        id: 1,
+        method: 'Runtime.evaluate',
+        params: {
+          expression,
+          awaitPromise: true,
+          returnByValue: true,
+        },
+      }));
+    });
+
+    ws.on('message', (data) => {
+      const message = JSON.parse(String(data));
+      if (message.id !== 1) return;
+      clearTimeout(timer);
+      ws.close();
+      if (message.error) {
+        reject(new Error(message.error.message || 'CDP error'));
+        return;
+      }
+      if (message.result?.exceptionDetails) {
+        reject(new Error('CDP evaluation exception'));
+        return;
+      }
+      resolve(message.result?.result?.value);
+    });
+
+    ws.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+async function findMonarchPage(): Promise<CdpTarget | null> {
+  const targets = await getCdpTargets();
+  return targets.find((target) =>
+    target.type === 'page' &&
+    target.webSocketDebuggerUrl &&
+    /monarch(money)?\.com/i.test(target.url)
+  ) || null;
+}
+
+async function getBrowserTokenCandidates(): Promise<Array<{ source: string; key: string; length: number; value: string }>> {
+  let page = await findMonarchPage();
+  if (!page) {
+    await openMonarchTab();
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    page = await findMonarchPage();
+  }
+  if (!page?.webSocketDebuggerUrl) {
+    throw new Error('No Monarch browser tab available via CDP');
+  }
+
+  const expression = `(() => {
+    const out = [];
+    const collect = (source, store) => {
+      for (let i = 0; i < store.length; i++) {
+        const key = store.key(i);
+        const value = store.getItem(key) || '';
+        if (/token|jwt|auth|session|access/i.test(key) || /^eyJ/.test(value)) {
+          out.push({ source, key, length: value.length, value });
+        }
+      }
+    };
+    collect('localStorage', window.localStorage);
+    collect('sessionStorage', window.sessionStorage);
+    return out;
+  })()`;
+
+  const result = await cdpEvaluate(page.webSocketDebuggerUrl, expression);
+  if (!Array.isArray(result)) return [];
+  return result.filter((candidate: any) => typeof candidate?.value === 'string');
+}
+
+async function refreshTokenFromBrowser(): Promise<{ refreshed: boolean; candidates: number; saved_key?: string }> {
+  const candidates = await getBrowserTokenCandidates();
+  for (const candidate of candidates) {
+    const token = candidate.value.trim();
+    if (token.length < 40) continue;
+    const client = createMonarchClient(token);
+    if (await client.testConnection()) {
+      saveMonarchToken(token);
+      clearStatusCache();
+      return {
+        refreshed: true,
+        candidates: candidates.length,
+        saved_key: `${candidate.source}:${candidate.key}`,
+      };
+    }
+  }
+  return { refreshed: false, candidates: candidates.length };
+}
+
+function renderBrowserPage(key: string, message = ''): string {
+  const vncPassword = process.env.NOVNC_PASSWORD ? 'configured' : 'missing';
+  return `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Monarch Browser Admin</title>
+<style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0f172a;color:#e2e8f0;margin:0}main{max-width:720px;margin:8vh auto;padding:28px;background:#111827;border:1px solid #334155;border-radius:18px}a,button{color:#082f49;background:#38bdf8;border:0;border-radius:10px;padding:10px 14px;font-weight:800;text-decoration:none;cursor:pointer}.row{display:flex;gap:12px;flex-wrap:wrap}.msg{margin:16px 0;padding:12px;border-radius:12px;background:#1e293b;white-space:pre-wrap}.hint{color:#94a3b8;line-height:1.45}code{background:#020617;padding:2px 5px;border-radius:6px}</style></head>
+<body><main><h1>Monarch Browser Admin</h1>
+<p class="hint">Use noVNC to log into Monarch in the persistent container browser. Then refresh the ingestor token from browser storage.</p>
+${message ? `<div class="msg">${htmlEscape(message)}</div>` : ''}
+<p>noVNC password: <code>${vncPassword}</code></p>
+<div class="row">
+  <a href="/vnc.html" target="_blank">Open noVNC</a>
+  <form method="post" action="/admin/browser/open"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Open Monarch tab</button></form>
+  <form method="post" action="/admin/browser/refresh-token"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Refresh token from browser</button></form>
+</div>
+<p class="hint">CDP stays localhost-only; this page never prints cookies or tokens.</p>
+</main></body></html>`;
 }
 
 function renderMfaPage(key: string, message = ''): string {
@@ -197,6 +349,62 @@ export function createServer(): express.Application {
         ? 'Monarch rejected that code or it expired. Wait for a fresh code and retry.'
         : `Refresh failed: ${message}`;
       res.status(400).type('html').send(renderMfaPage(key, safeMessage));
+    }
+  });
+
+  app.get('/admin/browser', (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+    res.type('html').send(renderBrowserPage(String(req.query.key || '')));
+  });
+
+  app.get('/admin/browser/status', async (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+      const targets = await getCdpTargets();
+      res.json({
+        ok: true,
+        cdp_reachable: true,
+        pages: targets
+          .filter((target) => target.type === 'page')
+          .map((target) => ({ title: target.title, url: target.url })),
+      });
+    } catch (error) {
+      res.status(503).json({
+        ok: false,
+        cdp_reachable: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  app.post('/admin/browser/open', async (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+    const key = String(req.body?.key || req.query.key || '');
+    try {
+      await openMonarchTab();
+      res.type('html').send(renderBrowserPage(key, 'Opened Monarch login tab in the container browser.'));
+    } catch (error) {
+      res.status(500).type('html').send(renderBrowserPage(key, `Failed to open Monarch tab: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  });
+
+  app.post('/admin/browser/refresh-token', async (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+    const key = String(req.body?.key || req.query.key || '');
+    try {
+      const result = await refreshTokenFromBrowser();
+      if (!result.refreshed) {
+        res.status(400).type('html').send(renderBrowserPage(key, `No usable Monarch API token found in browser storage. Candidates scanned: ${result.candidates}. Log into Monarch in noVNC, then retry.`));
+        return;
+      }
+
+      const { runSync } = await import('./sync.js');
+      runSync({ full: false }).catch((error) => {
+        console.error('[admin-browser] Sync error after browser token refresh:', error);
+      });
+      res.type('html').send(renderBrowserPage(key, `Token refreshed from browser storage (${result.saved_key}). Incremental sync started.`));
+    } catch (error) {
+      res.status(500).type('html').send(renderBrowserPage(key, `Browser refresh failed: ${error instanceof Error ? error.message : String(error)}`));
     }
   });
 
