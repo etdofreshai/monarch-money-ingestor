@@ -471,9 +471,14 @@ async function runBrowserBackedSync(full = false): Promise<{ new: number; update
   const lastRecordDate = syncState?.last_record_date;
   let startDate: string | undefined;
   if (!full && lastRecordDate) {
-    const bufferDate = new Date(lastRecordDate);
-    bufferDate.setDate(bufferDate.getDate() - 7);
-    startDate = bufferDate.toISOString().split('T')[0];
+    const parsedLastRecordDate = new Date(lastRecordDate);
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (parsedLastRecordDate <= tomorrow) {
+      const bufferDate = new Date(lastRecordDate);
+      bufferDate.setDate(bufferDate.getDate() - 7);
+      startDate = bufferDate.toISOString().split('T')[0];
+    }
   }
 
   const query = `query BrowserBackedTransactions($offset: Int, $limit: Int, $filters: TransactionFilterInput, $orderBy: TransactionOrdering) {
@@ -496,6 +501,8 @@ async function runBrowserBackedSync(full = false): Promise<{ new: number; update
   let totalUpdated = 0;
   let totalSkipped = 0;
   let latestDate: Date | null = null;
+  const latestRecordDateCap = new Date();
+  latestRecordDateCap.setDate(latestRecordDateCap.getDate() + 1);
 
   while (true) {
     const filters: Record<string, unknown> = {};
@@ -520,7 +527,7 @@ async function runBrowserBackedSync(full = false): Promise<{ new: number; update
 
     for (const txn of transactions) {
       const d = txn.date ? new Date(txn.date) : null;
-      if (d && (!latestDate || d > latestDate)) latestDate = d;
+      if (d && d <= latestRecordDateCap && (!latestDate || d > latestDate)) latestDate = d;
     }
 
     offset += transactions.length;
@@ -617,6 +624,13 @@ export function createServer(): express.Application {
     try {
       const refresh = req.query.refresh === 'true';
       const status = await getStatus(!refresh);
+      if (!status.api_reachable) {
+        const browserProbe = await probeBrowserGraphql();
+        if (browserProbe.ok) {
+          status.api_reachable = true;
+          status.error = undefined;
+        }
+      }
       res.json(status);
     } catch (error) {
       console.error('Error getting status:', error);
