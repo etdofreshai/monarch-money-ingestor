@@ -10,6 +10,7 @@ RUN apk add --no-cache \
     websockify \
     openbox \
     supervisor \
+    xdotool \
     ca-certificates \
     ttf-liberation \
   && mkdir -p /data/chrome-profile /var/log/supervisor

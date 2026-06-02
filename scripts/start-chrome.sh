@@ -33,6 +33,8 @@ exec "$CHROME" \
   --disable-dev-shm-usage \
   --disable-gpu \
   --window-size=1280,900 \
+  --window-position=0,0 \
+  --start-maximized \
   --no-first-run \
   --no-default-browser-check \
   "$START_URL"
