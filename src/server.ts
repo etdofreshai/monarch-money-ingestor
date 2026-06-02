@@ -232,21 +232,64 @@ async function probeBrowserGraphql(): Promise<{ ok: boolean; totalCount?: number
     return { ok: false, error: 'No logged-in Monarch page found' };
   }
 
-  const expression = `fetch('https://api.monarch.com/graphql', {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
+  const expression = `(() => {
+    const cookie = document.cookie || '';
+    const csrf = (cookie.match(/(?:^|; )csrftoken=([^;]+)/) || [])[1] || (cookie.match(/(?:^|; )csrf=([^;]+)/) || [])[1] || '';
+    const findDeviceUuid = () => {
+      const scan = (value, depth = 0) => {
+        if (depth > 5 || value == null) return '';
+        if (typeof value === 'string') {
+          if (/^[0-9a-f-]{32,36}$/i.test(value)) return value;
+          if ((value.startsWith('{') || value.startsWith('[')) && value.length < 200000) {
+            try { return scan(JSON.parse(value), depth + 1); } catch (_) {}
+          }
+          return '';
+        }
+        if (Array.isArray(value)) {
+          for (const item of value) { const found = scan(item, depth + 1); if (found) return found; }
+          return '';
+        }
+        if (typeof value === 'object') {
+          for (const [key, nested] of Object.entries(value)) {
+            if (/device.*uuid|uuid/i.test(key) && typeof nested === 'string' && nested.length >= 16) return nested;
+            const found = scan(nested, depth + 1); if (found) return found;
+          }
+        }
+        return '';
+      };
+      for (const store of [window.localStorage, window.sessionStorage]) {
+        for (let i = 0; i < store.length; i++) {
+          const key = store.key(i);
+          if (/device.*uuid|uuid/i.test(key || '')) {
+            const direct = store.getItem(key) || '';
+            if (direct.length >= 16) return direct;
+          }
+          const found = scan(store.getItem(key) || '');
+          if (found) return found;
+        }
+      }
+      return '';
+    };
+    const headers = {
       'Accept': 'application/json',
       'Content-Type': 'application/json',
       'Client-Platform': 'web',
       'Monarch-Client': 'monarch-core-web-app-graphql',
       'Monarch-Client-Version': 'v1.0.1772'
-    },
-    body: JSON.stringify({
-      query: 'query BrowserProbe { allTransactions { totalCount __typename } }',
-      variables: {}
-    })
-  }).then(async (r) => ({ status: r.status, text: await r.text() }))`;
+    };
+    if (csrf) headers['x-csrftoken'] = decodeURIComponent(csrf);
+    const deviceUuid = findDeviceUuid();
+    if (deviceUuid) headers['device-uuid'] = deviceUuid;
+    return fetch('https://api.monarch.com/graphql', {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body: JSON.stringify({
+        query: 'query BrowserProbe { allTransactions { totalCount __typename } }',
+        variables: {}
+      })
+    }).then(async (r) => ({ status: r.status, text: await r.text(), sentHeaders: Object.keys(headers) }));
+  })()`;
 
   try {
     const result: any = await cdpEvaluate(page.webSocketDebuggerUrl, expression);
