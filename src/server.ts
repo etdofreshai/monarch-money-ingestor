@@ -293,6 +293,7 @@ function cdpCaptureGraphql(webSocketUrl: string): Promise<{ ok: boolean; url?: s
       const req = message.params?.request;
       const url = String(req?.url || '');
       if (!url.includes('api.monarch.com/graphql')) return;
+      if (String(req?.method || '').toUpperCase() === 'OPTIONS') return;
       const headers = req?.headers || {};
       const headerNames = Object.keys(headers).sort();
       const authValue = String(headers.Authorization || headers.authorization || '');
