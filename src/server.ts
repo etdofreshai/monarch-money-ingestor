@@ -184,6 +184,7 @@ async function refreshTokenFromBrowser(): Promise<{ refreshed: boolean; candidat
 
 function renderBrowserPage(key: string, message = ''): string {
   const vncPassword = process.env.NOVNC_PASSWORD ? 'configured' : 'missing';
+  const novncUrl = process.env.NOVNC_PUBLIC_URL || 'https://monarch-browser.etdofresh.com/vnc.html';
   return `<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Monarch Browser Admin</title>
@@ -193,7 +194,7 @@ function renderBrowserPage(key: string, message = ''): string {
 ${message ? `<div class="msg">${htmlEscape(message)}</div>` : ''}
 <p>noVNC password: <code>${vncPassword}</code></p>
 <div class="row">
-  <a href="/vnc.html" target="_blank">Open noVNC</a>
+  <a href="${htmlEscape(novncUrl)}" target="_blank">Open noVNC</a>
   <form method="post" action="/admin/browser/open"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Open Monarch tab</button></form>
   <form method="post" action="/admin/browser/refresh-token"><input type="hidden" name="key" value="${htmlEscape(key)}" /><button type="submit">Refresh token from browser</button></form>
 </div>
