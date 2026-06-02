@@ -79,24 +79,16 @@ async function openMonarchTab(): Promise<CdpTarget> {
   return await fetchJson<CdpTarget>(`${getCdpBaseUrl()}/json/new?${encodeURIComponent(url)}`);
 }
 
-function cdpEvaluate(webSocketUrl: string, expression: string): Promise<unknown> {
+function cdpCall(webSocketUrl: string, method: string, params: Record<string, unknown> = {}): Promise<any> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(webSocketUrl);
     const timer = setTimeout(() => {
       ws.close();
-      reject(new Error('CDP evaluation timed out'));
+      reject(new Error(`CDP ${method} timed out`));
     }, 10000);
 
     ws.on('open', () => {
-      ws.send(JSON.stringify({
-        id: 1,
-        method: 'Runtime.evaluate',
-        params: {
-          expression,
-          awaitPromise: true,
-          returnByValue: true,
-        },
-      }));
+      ws.send(JSON.stringify({ id: 1, method, params }));
     });
 
     ws.on('message', (data) => {
@@ -108,11 +100,7 @@ function cdpEvaluate(webSocketUrl: string, expression: string): Promise<unknown>
         reject(new Error(message.error.message || 'CDP error'));
         return;
       }
-      if (message.result?.exceptionDetails) {
-        reject(new Error('CDP evaluation exception'));
-        return;
-      }
-      resolve(message.result?.result?.value);
+      resolve(message.result);
     });
 
     ws.on('error', (error) => {
@@ -120,6 +108,18 @@ function cdpEvaluate(webSocketUrl: string, expression: string): Promise<unknown>
       reject(error);
     });
   });
+}
+
+async function cdpEvaluate(webSocketUrl: string, expression: string): Promise<unknown> {
+  const result = await cdpCall(webSocketUrl, 'Runtime.evaluate', {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (result?.exceptionDetails) {
+    throw new Error('CDP evaluation exception');
+  }
+  return result?.result?.value;
 }
 
 async function findMonarchPage(): Promise<CdpTarget | null> {
@@ -144,13 +144,39 @@ async function getBrowserTokenCandidates(): Promise<Array<{ source: string; key:
 
   const expression = `(() => {
     const out = [];
+    const seen = new Set();
+    const add = (source, key, value) => {
+      if (typeof value !== 'string') return;
+      const trimmed = value.trim();
+      if (trimmed.length < 20) return;
+      const id = source + ':' + key + ':' + trimmed.slice(0, 24);
+      if (seen.has(id)) return;
+      if (/token|jwt|auth|session|access/i.test(key) || /^eyJ/.test(trimmed) || trimmed.length > 80) {
+        seen.add(id);
+        out.push({ source, key, length: trimmed.length, value: trimmed });
+      }
+    };
+    const walk = (source, key, value, depth = 0) => {
+      if (depth > 5 || value == null) return;
+      if (typeof value === 'string') {
+        add(source, key, value);
+        if ((value.startsWith('{') || value.startsWith('[')) && value.length < 200000) {
+          try { walk(source, key + '.json', JSON.parse(value), depth + 1); } catch (_) {}
+        }
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach((item, idx) => walk(source, key + '[' + idx + ']', item, depth + 1));
+        return;
+      }
+      if (typeof value === 'object') {
+        Object.entries(value).forEach(([k, v]) => walk(source, key + '.' + k, v, depth + 1));
+      }
+    };
     const collect = (source, store) => {
       for (let i = 0; i < store.length; i++) {
         const key = store.key(i);
-        const value = store.getItem(key) || '';
-        if (/token|jwt|auth|session|access/i.test(key) || /^eyJ/.test(value)) {
-          out.push({ source, key, length: value.length, value });
-        }
+        walk(source, key, store.getItem(key) || '');
       }
     };
     collect('localStorage', window.localStorage);
@@ -159,8 +185,26 @@ async function getBrowserTokenCandidates(): Promise<Array<{ source: string; key:
   })()`;
 
   const result = await cdpEvaluate(page.webSocketDebuggerUrl, expression);
-  if (!Array.isArray(result)) return [];
-  return result.filter((candidate: any) => typeof candidate?.value === 'string');
+  const candidates = Array.isArray(result)
+    ? result.filter((candidate: any) => typeof candidate?.value === 'string')
+    : [];
+
+  const cookiesResult = await cdpCall(page.webSocketDebuggerUrl, 'Network.getAllCookies');
+  const cookies = Array.isArray(cookiesResult?.cookies) ? cookiesResult.cookies : [];
+  for (const cookie of cookies) {
+    if (!/monarch(money)?\.com$/i.test(String(cookie.domain || '').replace(/^\./, ''))) continue;
+    const value = String(cookie.value || '').trim();
+    if (value.length >= 20) {
+      candidates.push({
+        source: 'cookie',
+        key: String(cookie.name || 'unknown'),
+        length: value.length,
+        value,
+      });
+    }
+  }
+
+  return candidates;
 }
 
 async function refreshTokenFromBrowser(): Promise<{ refreshed: boolean; candidates: number; saved_key?: string }> {
